@@ -1,8 +1,8 @@
 import itertools
-import json
 import re
 
 from .common import InfoExtractor
+from .. import float_or_none
 from ..networking.exceptions import HTTPError
 from ..utils import (
     ExtractorError,
@@ -10,11 +10,14 @@ from ..utils import (
     clean_html,
     format_field,
     get_element_by_class,
+    get_elements_by_attribute,
     int_or_none,
     join_nonempty,
     parse_count,
     parse_iso8601,
+    str_or_none,
     traverse_obj,
+    truncate_string,
     unescapeHTML,
     update_url_query,
     url_or_none,
@@ -411,30 +414,68 @@ class RumbleChannelIE(InfoExtractor):
         'only_matching': True,
     }]
 
+    def _parse_video(self, video_data):
+        video_id = traverse_obj(video_data, 'id')
+        video_id = str(video_id) if video_id is not None else None
+
+        formats = []
+        for video in traverse_obj(video_data, ('videos', ...), default=[]):
+            video_url = traverse_obj(video, ('url', {url_or_none}))
+            if not video_url:
+                continue
+
+            video_type = traverse_obj(video, ('type', {str_or_none}))
+            format_ = {
+                'url': video_url,
+                'height': traverse_obj(video, ('resolution', {int_or_none})),
+                'tbr': traverse_obj(video, ('bitrate_kbps', {float_or_none})),
+                'format_id': video_type,
+            }
+            if video_type == 'hls':
+                format_['protocol'] = 'm3u8'
+            formats.append(format_)
+
+        if not formats:
+            return None
+
+        return {
+            'id': video_id,
+            'title': traverse_obj(video_data, ('title', {truncate_string(left=72)})),
+            'webpage_url': traverse_obj(video_data, ('url', {url_or_none})),
+            'thumbnail': traverse_obj(video_data, ('thumb', {url_or_none})),
+            'duration': traverse_obj(video_data, ('duration', {int_or_none})),
+            'view_count': traverse_obj(video_data, ('views', {int_or_none})),
+            'like_count': traverse_obj(video_data, ('rumble_votes', 'score', {int_or_none})),
+            'comment_count': traverse_obj(video_data, ('comments', 'count', {int_or_none})),
+            'uploader': traverse_obj(video_data, ('by', 'name', {str_or_none})),
+            'uploader_id': traverse_obj(video_data, ('by', 'id', {str_or_none})),
+            'upload_date': traverse_obj(video_data, ('upload_date', {lambda x: x[:10].replace('-', '')})),
+            'formats': formats,
+        }
+
+    def _extract_items_data(self, webpage):
+        for json_text in get_elements_by_attribute('type', 'application/json', webpage):
+            data = self._parse_json(json_text, 'playlist_items_json', fatal=False)
+            if isinstance(data, dict) and data.get('items'):
+                return data
+
+        return None
+
     def entries(self, url, playlist_id):
-        for page_num in itertools.count(1):
-            for retry in self.RetryManager():
-                try:
-                    page = self._download_webpage(url, playlist_id, query={'page': page_num}, note=f'Downloading page {page_num}')
-                except ExtractorError as e:
-                    if isinstance(e.cause, HTTPError) and e.cause.status == 404:
-                        break
-                    if isinstance(e.cause, TimeoutError):
-                        retry.error = e.cause
-                        continue
-                    raise
+        for page in itertools.count(1):
+            try:
+                webpage = self._download_webpage(f'{url}?page={page}', playlist_id, note=f'Downloading page {page}')
+            except ExtractorError as e:
+                if isinstance(e.cause, HTTPError) and e.cause.status == 404:
+                    break
+                raise
 
-            video_items = []
-            for raw_video_item in re.findall(r'<script[^>]+>\s*(\{[\s\S]+?["\']items"[\s\S]+?\})\s*</script>', page):
-                video_items(traverse_obj(raw_video_item, ({json.loads}, 'items', {list}), default=[]))
+            data = self._extract_items_data(webpage)
 
-            if not video_items:
-                break
-
-            for entry_url in traverse_obj(video_items, ('items', ..., 'url', {url_or_none})):
-                yield self.url_result(entry_url, RumbleIE)
+            for item in traverse_obj(data, ('items', ...), default=[])[:3]:
+                yield self._parse_video(item)
 
     def _real_extract(self, url):
-        url = update_url_query(url, query={'page', []})
+        url = update_url_query(url, query={'page': []})
         playlist_id = self._match_id(url)
         return self.playlist_result(self.entries(url, playlist_id), playlist_id=playlist_id)
